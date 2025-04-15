@@ -30,7 +30,7 @@ RECOGNIZED_SETTINGS = list(DEFAULT_SETTINGS.keys())
 RECOGNIZED_SETTINGS.extend([
     'filename', 'data_dir', 'results_dir', 'probe_name', 'probe_path',
     'data_file_path', 'probe', 'data_dtype', 'save_preprocessed_copy',
-    'clear_cache', 'do_CAR', 'invert_sign'
+    'clear_cache', 'do_CAR', 'invert_sign', 'verbose_log'
 ])
 
 
@@ -39,7 +39,7 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                  data_dtype=None, do_CAR=True, invert_sign=False, device=None,
                  progress_bar=None, save_extra_vars=False, clear_cache=False,
                  save_preprocessed_copy=False, bad_channels=None,
-                 verbose_console=False):
+                 verbose_console=False, verbose_log=False):
     """Run full spike sorting pipeline on specified data.
     
     Parameters
@@ -112,6 +112,10 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
         If True, set logging level for console output to `DEBUG` instead
         of `INFO`, so that additional information normally only saved to the
         log file will also show up in real time while sorting.
+    verbose_log : bool; default=False.
+        If True, include additional debug-level logging statements for some
+        steps. This provides more detail for debugging, but may impact
+        performance.
     
     Raises
     ------
@@ -166,8 +170,25 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
     settings = {**DEFAULT_SETTINGS, **settings}
     # NOTE: This modifies settings in-place
     filename, data_dir, results_dir, probe = \
-        set_files(settings, filename, probe, probe_name, data_dir, results_dir, bad_channels)
+        set_files(settings, filename, probe, probe_name, data_dir,
+                  results_dir, bad_channels)
     setup_logger(results_dir, verbose_console=verbose_console)
+
+    ops, st, clu, tF, Wall, similar_templates, \
+        is_ref, est_contam_rate, kept_spikes = _sort(
+            filename, results_dir, probe, settings, data_dtype, device, do_CAR,
+            clear_cache, invert_sign, save_preprocessed_copy, verbose_log,
+            save_extra_vars, file_object, progress_bar
+        )
+
+    return ops, st, clu, tF, Wall, similar_templates, \
+           is_ref, est_contam_rate, kept_spikes
+
+
+def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
+          clear_cache, invert_sign, save_preprocessed_copy, verbose_log,
+          save_extra_vars, file_object, progress_bar, gui_sorter=None):
+    """Run sorting pipeline. See `run_kilosort` for documentation."""
 
     try:
         logger.info(f"Kilosort version {kilosort.__version__}")
@@ -214,12 +235,14 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
 
         tic0 = time.time()
         ops = initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
-                            device, save_preprocessed_copy)
+                                device, save_preprocessed_copy)
         
-        # Remove some stuff that doesn't need to be printed twice, then pretty-print
-        # format for log file.
+        # Pretty-print ops and probe for log
         logger.debug(f"Initial ops:\n\n{ops_as_string(ops)}\n")
         logger.debug(f"Probe dictionary:\n\n{probe_as_string(ops['probe'])}\n")
+
+        # Baseline performance metrics
+        log_performance(logger, 'info', 'Resource usage before sorting')
 
         # Set preprocessing and drift correction parameters
         ops = compute_preprocessing(ops, device, tic0=tic0, file_object=file_object)
@@ -229,23 +252,47 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
         ops, bfile, st0 = compute_drift_correction(
             ops, device, tic0=tic0, progress_bar=progress_bar,
             file_object=file_object, clear_cache=clear_cache,
+            verbose=verbose_log
             )
 
         # Check scale of data for log file
         b1 = bfile.padded_batch_to_torch(0).cpu().numpy()
         logger.debug(f"First batch min, max: {b1.min(), b1.max()}")
 
+        # Save preprocessing steps
         if save_preprocessed_copy:
             io.save_preprocessing(results_dir / 'temp_wh.dat', ops, bfile)
 
+        # Generate drift plots
+        # st0 will be None if nblocks = 0 (no drift correction)
+        if st0 is not None:
+            if gui_sorter is not None:
+                gui_sorter.dshift = ops['dshift']
+                gui_sorter.st0 = st0
+                gui_sorter.plotDataReady.emit('drift')
+            else:
+                # TODO: save non-GUI version of plot to results.
+                pass
+
         # Sort spikes and save results
-        st,tF, _, _ = detect_spikes(
+        st,tF, Wall0, clu0 = detect_spikes(
             ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
-            clear_cache=clear_cache
+            clear_cache=clear_cache, verbose=verbose_log
             )
-        clu, Wall = cluster_spikes(
+
+        # Generate diagnosic plots
+        if gui_sorter is not None:
+            gui_sorter.Wall0 = Wall0
+            gui_sorter.wPCA = torch.clone(ops['wPCA'].cpu()).numpy()
+            gui_sorter.clu0 = clu0
+            gui_sorter.plotDataReady.emit('diagnostics')
+        else:
+            # TODO: save non-GUI version of plot to results.
+            pass
+
+        clu, Wall, st, tF = cluster_spikes(
             st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
-            clear_cache=clear_cache
+            clear_cache=clear_cache, verbose=verbose_log,
             )
         ops, similar_templates, is_ref, est_contam_rate, kept_spikes = \
             save_sorting(
@@ -253,6 +300,21 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                 save_extra_vars=save_extra_vars,
                 save_preprocessed_copy=save_preprocessed_copy
                 )
+
+        # Generate spike positions plot
+        if gui_sorter is not None:
+            # TODO: re-use spike positions saved by `save_sorting` instead of
+            #       computing them again in `kilosort.gui.sanity_plots`.
+            gui_sorter.ops = ops
+            gui_sorter.st = st[kept_spikes]
+            gui_sorter.clu = clu[kept_spikes]
+            gui_sorter.tF = tF[kept_spikes]
+            gui_sorter.is_refractory = is_ref
+            gui_sorter.plotDataReady.emit('probe')
+        else:
+            # TODO: save non-GUI version of plot to results.
+            pass
+        
     except Exception as e:
         if isinstance(e, torch.cuda.OutOfMemoryError):
             logger.exception('Out of memory error, printing performance...')
@@ -267,6 +329,7 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
     
     finally:
         close_logger()
+
 
     return ops, st, clu, tF, Wall, similar_templates, \
            is_ref, est_contam_rate, kept_spikes
@@ -338,17 +401,17 @@ def setup_logger(results_dir, verbose_console=False):
     ks_log = logging.getLogger('kilosort')
     ks_log.setLevel(logging.DEBUG)
 
+    # Add file handler at debug level, include timestamps and logging level
+    # in text output.
+    file = logging.FileHandler(results_dir / 'kilosort4.log', mode='w')
+    file.setLevel(logging.DEBUG)
+    text_format = '%(asctime)s %(name)-12s %(levelname)-8s %(message)s'
+    file_formatter = logging.Formatter(text_format)
+    file.setFormatter(file_formatter)
+
     # Skip this if the handlers were already added, like when running multiple
     # times in a single session.
     if not ks_log.handlers:
-        # Add file handler at debug level, include timestamps and logging level
-        # in text output.
-        file = logging.FileHandler(results_dir / 'kilosort4.log', mode='w')
-        file.setLevel(logging.DEBUG)
-        text_format = '%(asctime)s %(name)-12s %(levelname)-8s %(message)s'
-        file_formatter = logging.Formatter(text_format)
-        file.setFormatter(file_formatter)
-
         # Add console handler at info level with shorter messages,
         # unless verbose is requested.
         console = logging.StreamHandler()
@@ -359,14 +422,16 @@ def setup_logger(results_dir, verbose_console=False):
             console.setLevel(logging.INFO)
             console_formatter = logging.Formatter('%(name)-12s: %(message)s')
             console.setFormatter(console_formatter)
-
-        ks_log.addHandler(file)
         ks_log.addHandler(console)
+
+    # Always add file handler since log file might change locations
+    ks_log.addHandler(file)
 
 
 def close_logger():
     ks_log = logging.getLogger('kilosort')
-    for handler in ks_log.handlers:
+    for handler in ks_log.handlers.copy():
+        ks_log.removeHandler(handler)
         handler.close()
 
 
@@ -507,7 +572,6 @@ def compute_preprocessing(ops, device, tic0=np.nan, file_object=None):
     whiten_mat = preprocessing.get_whitening_matrix(bfile, xc, yc, nskip=nskip,
                                                     nrange=whitening_range)
 
-    bfile.close()
 
     # Save results
     ops['Nbatches'] = bfile.n_batches
@@ -528,7 +592,7 @@ def compute_preprocessing(ops, device, tic0=np.nan, file_object=None):
 
 
 def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
-                             file_object=None, clear_cache=False):
+                             file_object=None, clear_cache=False, verbose=False):
     """Compute drift correction parameters and save them to `ops`.
 
     Parameters
@@ -545,6 +609,11 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
         Must have 'shape' and 'dtype' attributes and support array-like
         indexing (e.g. [:100,:], [5, 7:10], etc). For example, a numpy
         array or memmap.
+    clear_cache : bool; False.
+        If True, force pytorch to clear cached cuda memory after some
+        memory-intensive steps in the pipeline.
+    verbose : bool; False.
+        If true, include additional debug-level logging statements.
 
     Returns
     -------
@@ -567,7 +636,6 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
         _, _, tmin, tmax, artifact, shift, scale = get_run_parameters(ops)
     hp_filter = ops['preprocessing']['hp_filter']
     whiten_mat = ops['preprocessing']['whiten_mat']
-
     bfile = io.BinaryFiltered(
         ops['filename'], n_chan_bin, fs, NT, nt, twav_min, chan_map, 
         hp_filter=hp_filter, whiten_mat=whiten_mat, device=device, do_CAR=do_CAR,
@@ -577,8 +645,7 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
         )
 
     ops, st = datashift.run(ops, bfile, device=device, progress_bar=progress_bar,
-                            clear_cache=clear_cache)
-    bfile.close()
+                            clear_cache=clear_cache, verbose=verbose)
     logger.info(f'drift computed in {time.time()-tic : .2f}s; ' + 
                 f'total {time.time()-tic0 : .2f}s')
     if st is not None:
@@ -603,7 +670,7 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
 
 
 def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
-                  clear_cache=False):
+                  clear_cache=False, verbose=False):
     """Detect spikes via template deconvolution.
     
     Parameters
@@ -618,6 +685,11 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
         Start time of `run_kilosort`.
     progress_bar : TODO; optional.
         Informs `tqdm` package how to report progress, type unclear.
+    clear_cache : bool; False.
+        If True, force pytorch to clear cached cuda memory after some
+        memory-intensive steps in the pipeline.
+    verbose : bool; False.
+        If true, include additional debug-level logging statements.
 
     Returns
     -------
@@ -642,7 +714,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('-'*40)
     st0, tF, ops = spikedetect.run(
         ops, bfile, device=device, progress_bar=progress_bar,
-        clear_cache=clear_cache
+        clear_cache=clear_cache, verbose=verbose
         )
     tF = torch.from_numpy(tF)
     logger.info(f'{len(st0)} spikes extracted in {time.time()-tic : .2f}s; ' + 
@@ -658,9 +730,11 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('-'*40)
     clu, Wall = clustering_qr.run(
         ops, st0, tF, mode='spikes', device=device, progress_bar=progress_bar,
-        clear_cache=clear_cache
+        clear_cache=clear_cache, verbose=verbose
         )
-    Wall3 = template_matching.postprocess_templates(Wall, ops, clu, st0, device=device)
+    Wall3 = template_matching.postprocess_templates(
+        Wall, ops, clu, st0, tF, device=device
+        )
     logger.info(f'{clu.max()+1} clusters found, in {time.time()-tic : .2f}s; ' +
                 f'total {time.time()-tic0 : .2f}s')
     logger.debug(f'clu shape: {clu.shape}')
@@ -670,8 +744,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info(' ')
     logger.info('Extracting spikes using cluster waveforms')
     logger.info('-'*40)
-    st, tF, ops = template_matching.extract(ops, bfile, Wall3, device=device,
-                                                 progress_bar=progress_bar)
+    st, tF, ops = template_matching.extract(
+        ops, bfile, Wall3, device=device, progress_bar=progress_bar
+        )
     logger.info(f'{len(st)} spikes extracted in {time.time()-tic : .2f}s; ' +
                 f'total {time.time()-tic0 : .2f}s')
     logger.debug(f'st shape: {st.shape}')
@@ -686,7 +761,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
 
 
 def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
-                   clear_cache=False):
+                   clear_cache=False, verbose=False):
     """Cluster spikes using graph-based methods.
     
     Parameters
@@ -707,6 +782,11 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         Start time of `run_kilosort`.
     progress_bar : TODO; optional.
         Informs `tqdm` package how to report progress, type unclear.
+    clear_cache : bool; False.
+        If True, force pytorch to clear cached cuda memory after some
+        memory-intensive steps in the pipeline.
+    verbose : bool; False.
+        If True, include additional debug-level logging statements.
 
     Returns
     -------
@@ -724,7 +804,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('-'*40)
     clu, Wall = clustering_qr.run(
         ops, st, tF,  mode = 'template', device=device, progress_bar=progress_bar,
-        clear_cache=clear_cache
+        clear_cache=clear_cache, verbose=verbose
         )
     logger.info(f'{clu.max()+1} clusters found, in {time.time()-tic : .2f}s; ' + 
                 f'total {time.time()-tic0 : .2f}s')
@@ -735,20 +815,19 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info(' ')
     logger.info('Merging clusters')
     logger.info('-'*40)
-    Wall, clu, is_ref = template_matching.merging_function(ops, Wall, clu, st[:,0],
-                                                           device=device)
+    Wall, clu, is_ref, st, tF = template_matching.merging_function(
+        ops, Wall, clu, st, tF, device=device, check_dt=True
+        )
     clu = clu.astype('int32')
     logger.info(f'{clu.max()+1} units found, in {time.time()-tic : .2f}s; ' + 
                 f'total {time.time()-tic0 : .2f}s')
     logger.debug(f'clu shape: {clu.shape}')
     logger.debug(f'Wall shape: {Wall.shape}')
 
-    bfile.close()
-
     log_performance(logger, 'info', 'Resource usage after clustering')
     log_cuda_details(logger)
 
-    return clu, Wall
+    return clu, Wall, st, tF
 
 
 def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
